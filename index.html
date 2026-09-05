@@ -3407,6 +3407,24 @@ function renderStats(){
   areaChart($('sActSpark'), actSeries, 60, '#14E1B2', {fill:true,thin:true,progress:1});
 }
 
+/* harga sepuluh saham dasbor ditarik sekali, lalu dipakai bersama */
+var hargaPasar = null, hargaPasarAt = 0;
+
+function muatHargaPasar(){
+  if(hargaPasar && Date.now() - hargaPasarAt < 60000) return Promise.resolve(hargaPasar);
+  return ambilSpark(UNIVERSE.map(function(s){ return s.sym; })).then(function(peta){
+    if(!peta) return null;
+    hargaPasar = peta; hargaPasarAt = Date.now();
+    try{ renderTape(); renderMovers(); }catch(e){}
+    return peta;
+  }).catch(function(){ return null; });
+}
+
+function hargaAsli(sym){
+  var x = hargaPasar && hargaPasar[sym];
+  return x && isFinite(x.harga) ? x : null;
+}
+
 function renderMovers(){
   const rows = UNIVERSE.map(s=>{
     const h=buildHistory(s).map(d=>d.c);
@@ -3635,7 +3653,60 @@ function uraikanXML(teks, sumber){
   return hasil;
 }
 
+/* =========================================================================
+   ANTREAN & SIMPANAN PERMINTAAN
+   Gerbang gratis mudah kena batas bila ditembak puluhan permintaan sekaligus.
+   Semua pengambilan lewat sini: paling banyak dua berjalan bersamaan,
+   dan jawaban disimpan supaya tidak diminta dua kali.
+   ========================================================================= */
+var ANTRE = [], ANTRE_JALAN = 0, ANTRE_MAKS = 2;
+var SIMPAN = {};                 /* alamat -> { teks, waktu } */
+var SIMPAN_UMUR = 120000;        /* dua menit */
+
+function antrekan(tugas){
+  return new Promise(function(selesai){
+    ANTRE.push({ tugas: tugas, selesai: selesai });
+    jalankanAntrean();
+  });
+}
+
+function jalankanAntrean(){
+  while(ANTRE_JALAN < ANTRE_MAKS && ANTRE.length){
+    var a = ANTRE.shift();
+    ANTRE_JALAN++;
+    a.tugas().then(function(h){
+      ANTRE_JALAN--;
+      a.selesai(h);
+      jalankanAntrean();
+    }, function(){
+      ANTRE_JALAN--;
+      a.selesai(null);
+      jalankanAntrean();
+    });
+  }
+}
+
+function simpanan(alamat){
+  var s = SIMPAN[alamat];
+  if(s && Date.now() - s.waktu < SIMPAN_UMUR) return s.teks;
+  return null;
+}
+function taruhSimpanan(alamat, teks){
+  SIMPAN[alamat] = { teks: teks, waktu: Date.now() };
+  /* jaga agar tidak menumpuk */
+  var kunci = Object.keys(SIMPAN);
+  if(kunci.length > 120){
+    kunci.slice(0, 40).forEach(function(k){ delete SIMPAN[k]; });
+  }
+}
+
 function ambilTeks(url, ms){
+  var tersimpan = simpanan(url);
+  if(tersimpan) return Promise.resolve(tersimpan);
+  return antrekan(function(){ return ambilTeksLangsung(url, ms); });
+}
+
+function ambilTeksLangsung(url, ms){
   return new Promise(function(selesai){
     var batal = null, jam = null;
     try{
@@ -3646,7 +3717,12 @@ function ambilTeks(url, ms){
     }catch(e){}
     fetch(url, batal ? { signal: batal.signal } : undefined)
       .then(function(r){ return r && r.ok ? r.text() : null; })
-      .then(function(t){ if (jam) clearTimeout(jam); selesai(t && t.length > 150 ? t : null); })
+      .then(function(t){
+        if (jam) clearTimeout(jam);
+        var hasil = t && t.length > 150 ? t : null;
+        if(hasil) taruhSimpanan(url, hasil);
+        selesai(hasil);
+      })
       .catch(function(){ if (jam) clearTimeout(jam); selesai(null); });
   });
 }
@@ -3928,7 +4004,7 @@ function urlKutipan(sym, range, interval){
 }
 
 function ambilJSON(url, ms){
-  return ambilTeks(url, ms || 11000).then(function(t){
+  return ambilTeks(url, ms || 28000).then(function(t){
     if(!t) return null;
     try{ return JSON.parse(t); }catch(e){ return null; }
   });
@@ -3946,7 +4022,7 @@ function lombaGerbang(target, ubah){
       try{ alamat = g(target); }catch(e){ alamat = null; }
       if(!alamat){ if(--sisa === 0 && !sudah) selesai(null); return; }
 
-      ambilTeks(alamat, 20000).then(function(t){
+      ambilTeks(alamat, 28000).then(function(t){
         if(sudah) return;
         var hasil = null;
         var isi = bukaBungkus(t);
@@ -3988,7 +4064,7 @@ var caraLangsung = null;   // null = belum tahu, true/false = sudah terbukti
 function ambilJSONCerdas(target){
   if(caraLangsung === false) return lewatGerbangJSON(target);
 
-  return ambilJSON(target, 9000).then(function(j){
+  return ambilJSON(target, 12000).then(function(j){
     if(j){ caraLangsung = true; return j; }
     if(caraLangsung === null) caraLangsung = false;
     return lewatGerbangJSON(target);
@@ -4415,6 +4491,27 @@ function ukuran(data){
 /* ---------- papan pergerakan dari kutipan asli ---------- */
 function ambilPapan(){
   if(papanData && Date.now() - papanAt < 90000) return Promise.resolve(papanData);
+
+  /* satu permintaan untuk sepuluh saham sekaligus */
+  var kode = UNIVERSE.slice(0, 10).map(function(s){ return s.sym; });
+  return ambilSpark(kode).then(function(peta){
+    if(peta){
+      var baris = UNIVERSE.slice(0, 10).map(function(s){
+        var x = peta[s.sym];
+        if(!x || !isFinite(x.harga)) return null;
+        return {
+          sym: s.sym, nama: s.name, harga: x.harga,
+          ch: x.prev ? (x.harga - x.prev) / x.prev * 100 : 0,
+          asli: true
+        };
+      }).filter(Boolean);
+      if(baris.length){ papanData = baris; papanAt = Date.now(); return baris; }
+    }
+    return papanLama();
+  }).catch(papanLama);
+}
+
+function papanLama(){
   var daftar = UNIVERSE.slice(0, 10);
   return Promise.all(daftar.map(function(s){
     var alamat = MARKET_API
@@ -4901,7 +4998,7 @@ function muatEmiten(){
   CSV_URL.forEach(function(alamat){
     urut = urut.then(function(sebelum){
       if(sebelum) return sebelum;
-      return ambilTeks(alamat, 20000).then(function(t){
+      return ambilTeks(alamat, 28000).then(function(t){
         var hasil = uraikanCSV(t);
         if(hasil) emSumber = 'csv';
         return hasil;
@@ -5172,11 +5269,13 @@ function ambilTrending(saatMaju){
     trProgres = Object.keys(peta).length;
     if(saatMaju) saatMaju(baris(), trProgres, TR_POOL.length);
 
-    /* lengkapi volume, tidak wajib berhasil */
-    var sisa = TR_POOL.slice();
+    /* volume hanya untuk sedikit saham teratas — menarik 50 lewat gerbang
+       gratis pasti kena batas, dan kategori gainer/loser tidak memerlukannya */
+    var urutBesar = baris().slice().sort(function(a, b){ return Math.abs(b.ch) - Math.abs(a.ch); });
+    var sisa = urutBesar.slice(0, 12).map(function(x){ return x.kode; });
     function gelombang(){
       if(!sisa.length) return Promise.resolve();
-      var kloter = sisa.splice(0, 5);
+      var kloter = sisa.splice(0, 3);
       return Promise.all(kloter.map(satuKutipan)).then(function(res){
         res.forEach(function(x){
           if(!x) return;
@@ -9718,11 +9817,12 @@ aman('statistik', ()=>{ countTo($('sListed'),903,{dur:1200});  });
 
 aman('pasar', ()=>{
   tandaiPasar();
+  muatHargaPasar();
   muatIndeksDasbor();
   setInterval(()=>aman('status-pasar', tandaiPasar), 60000);
   /* saat bursa buka, kartu dasbor ikut berdetak */
   setInterval(()=>aman('pasar-detak', ()=>{
-    if(bursaBuka()) muatIndeksDasbor();
+    if(bursaBuka()){ muatIndeksDasbor(); muatHargaPasar(); }
   }), 30000);
 });
 
@@ -9736,7 +9836,7 @@ requestAnimationFrame(function(){
   document.body.classList.add('booted');
   setTimeout(()=>aman('grafik-ihsg', ()=>drawIHSG(true)), 380);
 });
-setInterval(()=>aman('live', liveStep), 2600);
+setInterval(()=>aman('live', liveStep), 4000);
 
 if('serviceWorker' in navigator && location.protocol.indexOf('http') === 0){
   try{ navigator.serviceWorker.register('sw.js').catch(function(){}); }catch(e){}
