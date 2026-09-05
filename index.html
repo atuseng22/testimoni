@@ -5218,9 +5218,59 @@ function uraikanSpark(j){
   return Object.keys(keluar).length ? keluar : null;
 }
 
-function ambilSpark(kodes){
-  return ambilJSONCerdas(urlSpark(kodes)).then(uraikanSpark).catch(function(){ return null; });
+/* Bila alamat spark mati, harga ditarik satu per satu lewat alamat grafik.
+   Lebih banyak permintaan, tapi antrean menjaga agar tidak kena batas. */
+function sparkDariChart(kodes){
+  var peta = {};
+  var sisa = kodes.slice();
+
+  function gelombang(){
+    if(!sisa.length) return Promise.resolve(peta);
+    var kloter = sisa.splice(0, 3);
+    return Promise.all(kloter.map(function(k){
+      var simbol = k.indexOf('.') >= 0 || k.indexOf('-') >= 0 || k.indexOf('=') >= 0 ? k : k + '.JK';
+      return ambilJSONCerdas(urlKutipan(simbol, '5d', '1d')).then(function(j){
+        var d = j ? uraikanChart(j) : null;
+        if(!d || !d.meta || d.meta.harga == null) return;
+        var kunci = k.replace('.JK', '').replace('=X', '').replace('-USD', '');
+        peta[kunci] = {
+          harga: d.meta.harga,
+          prev: d.meta.prevLilin != null ? d.meta.prevLilin : d.meta.prev
+        };
+      }).catch(function(){});
+    })).then(gelombang);
+  }
+
+  return gelombang().then(function(){
+    return Object.keys(peta).length ? peta : null;
+  });
 }
+
+var sparkHidup = null;      /* null = belum tahu */
+
+function ambilSpark(kodes){
+  var simbol = kodes.map(function(k){
+    return (k.indexOf('.') >= 0 || k.indexOf('-') >= 0 || k.indexOf('=') >= 0) ? k : k + '.JK';
+  });
+
+  if(sparkHidup === false) return sparkDariChart(kodes);
+
+  return ambilJSONCerdas(urlSparkUmum(simbol))
+    .then(uraikanSpark)
+    .then(function(peta){
+      if(peta && Object.keys(peta).length){
+        sparkHidup = true;
+        return peta;
+      }
+      sparkHidup = false;
+      return sparkDariChart(kodes);
+    })
+    .catch(function(){
+      sparkHidup = false;
+      return sparkDariChart(kodes);
+    });
+}
+
 
 function satuKutipan(k){
   return ambilChart(k + '.JK', '5d', '1d').then(function(d){
@@ -5480,7 +5530,11 @@ function ujiSatu(nama, url){
           else {
             try{
               var j = JSON.parse(isi);
-              sah = !!(j && j.chart && j.chart.result && j.chart.result.length);
+              var adaChart = !!(j && j.chart && j.chart.result && j.chart.result.length);
+              var adaSpark = !!(j && (j.spark || Object.keys(j).some(function(k){
+                return j[k] && (j[k].close || (j[k].response && j[k].response.length));
+              })));
+              sah = adaChart || adaSpark;
               if(!sah) sebab = 'bukan data harga';
             }catch(e){ sebab = 'bukan JSON'; }
           }
@@ -5498,7 +5552,9 @@ function ujiSatu(nama, url){
 
 function jalankanUji(kotak){
   var sasaran = urlKutipan('BBCA.JK', '5d', '1d');
+  var sasaranSpark = urlSparkUmum(['BBCA.JK', 'BBRI.JK']);
   var daftar = [
+    ['Alamat daftar harga (spark)', GATEWAYS[1](sasaranSpark)],
     ['Langsung ke sumber', sasaran],
     ['Gerbang 1 (cors.lol)',       GATEWAYS[0](sasaran)],
     ['Gerbang 2 (allorigins raw)', GATEWAYS[1](sasaran)],
